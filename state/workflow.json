@@ -1,12 +1,12 @@
 {
   "id": "d5986f13-73d1-478b-8d2b-efa9befa5da1",
   "name": "pdf2md",
-  "currentPhase": "REQUIREMENTS",
+  "currentPhase": "DEVELOPMENT",
   "status": "in_progress",
   "phases": {
-    "REQUIREMENTS": { "status": "in_progress" },
-    "ARCHITECT": { "status": "pending" },
-    "TASK_PLANNING": { "status": "pending" },
+    "REQUIREMENTS": { "status": "completed" },
+    "ARCHITECT": { "status": "completed" },
+    "TASK_PLANNING": { "status": "completed" },
     "ACCEPTANCE_CRITERIA": { "status": "pending" },
     "DEVELOPMENT": { "status": "pending" },
     "REVIEW": { "status": "pending" },
