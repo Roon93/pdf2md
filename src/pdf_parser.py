@@ -1,19 +1,26 @@
 import sys
 import os
 import re
+import subprocess
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple, Set
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vendor'))
 
 from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTPage, LTTextBox, LTTextLine, LTChar, LTFigure, LTImage, LTRect
+from pdfminer.layout import (
+    LTPage, LTTextBox, LTTextLine, LTChar, LTFigure, LTImage,
+    LTRect, LTCurve, LTLine,
+)
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFSyntaxError
 
 from .utils import log_warn, log_error
 
+
+# ─── 数据结构 ────────────────────────────────────────────────
 
 @dataclass
 class Block:
@@ -31,8 +38,9 @@ class PDFParseError(Exception):
     pass
 
 
+# ─── 工具函数 ────────────────────────────────────────────────
+
 def _get_mode(values: list) -> float:
-    """返回列表中出现次数最多的值，列表为空返回 12.0。"""
     if not values:
         return 12.0
     counter = Counter(values)
@@ -40,7 +48,6 @@ def _get_mode(values: list) -> float:
 
 
 def _get_char_info(text_box) -> tuple:
-    """遍历 LTTextBox 中的 LTChar，返回 (avg_size, is_bold, is_italic)。"""
     sizes = []
     is_bold = False
     is_italic = False
@@ -50,42 +57,48 @@ def _get_char_info(text_box) -> tuple:
                 if isinstance(char, LTChar):
                     if char.size > 0:
                         sizes.append(char.size)
-                    fontname = char.fontname.lower() if char.fontname else ""
-                    if "bold" in fontname:
+                    fname = char.fontname.lower() if char.fontname else ""
+                    if "bold" in fname:
                         is_bold = True
-                    if "italic" in fontname or "oblique" in fontname:
+                    if "italic" in fname or "oblique" in fname:
                         is_italic = True
     avg_size = sum(sizes) / len(sizes) if sizes else 12.0
     return avg_size, is_bold, is_italic
 
 
-def _classify_block(text: str, avg_size: float, is_bold: bool, is_italic: bool, base_size: float) -> Block:
-    """根据文本内容和字体信息分类 Block。"""
+def _classify_block(text: str, avg_size: float, is_bold: bool, is_italic: bool,
+                   base_size: float) -> Block:
     stripped = text.lstrip()
 
-    # 检查无序列表
+    # 列表
     if stripped.startswith("- ") or stripped.startswith("• ") or stripped.startswith("* "):
-        return Block(type="list_item", content=text, ordered=False, bold=is_bold, italic=is_italic)
-
-    # 检查有序列表
+        return Block(type="list_item", content=text, ordered=False,
+                     bold=is_bold, italic=is_italic)
     if re.match(r'^\d+\. ', stripped):
-        return Block(type="list_item", content=text, ordered=True, bold=is_bold, italic=is_italic)
+        return Block(type="list_item", content=text, ordered=True,
+                     bold=is_bold, italic=is_italic)
 
-    # 检查标题（按字体大小）
+    # 标题
     if avg_size > base_size * 1.4:
-        return Block(type="heading", content=text, level=1, bold=is_bold, italic=is_italic)
+        return Block(type="heading", content=text, level=1,
+                     bold=is_bold, italic=is_italic)
     if avg_size > base_size * 1.2:
-        return Block(type="heading", content=text, level=2, bold=is_bold, italic=is_italic)
+        return Block(type="heading", content=text, level=2,
+                     bold=is_bold, italic=is_italic)
     if avg_size > base_size * 1.05:
-        return Block(type="heading", content=text, level=3, bold=is_bold, italic=is_italic)
+        return Block(type="heading", content=text, level=3,
+                     bold=is_bold, italic=is_italic)
     if is_bold and avg_size > base_size:
-        return Block(type="heading", content=text, level=3, bold=is_bold, italic=is_italic)
+        return Block(type="heading", content=text, level=3,
+                     bold=is_bold, italic=is_italic)
 
     return Block(type="paragraph", content=text, bold=is_bold, italic=is_italic)
 
 
-def _extract_images(figure, image_output_dir: str, image_counter: list) -> List[Block]:
-    """从 LTFigure 中提取图片，保存到 image_output_dir，返回 Block 列表。"""
+# ─── 图片提取 ────────────────────────────────────────────────
+
+def _extract_images(figure, image_output_dir: str,
+                   image_counter: list) -> List[Block]:
     result = []
     for item in figure:
         if isinstance(item, LTImage):
@@ -108,23 +121,252 @@ def _extract_images(figure, image_output_dir: str, image_counter: list) -> List[
     return result
 
 
-def _process_page(page_layout, base_size: float, image_output_dir: str, image_counter: list) -> List[Block]:
-    """处理单页，返回 Block 列表。"""
+# ─── 表格识别（启发式坐标重建）───────────────────────────────
+
+def _bbox(element) -> Tuple[float, float, float, float]:
+    """返回 (x0, y0, x1, y1)。"""
+    return (element.x0, element.y0, element.x1, element.y1)
+
+
+def _h_lines(rects, tol=3.0) -> List[float]:
+    """从矩形列表提取水平线 Y 坐标（去重）。"""
+    ys: Set[float] = set()
+    for r in rects:
+        if abs(r.y0 - r.y1) < tol:       # 扁矩形 = 水平线
+            ys.add(round(r.y0, 1))
+    return sorted(ys)
+
+
+def _v_lines(rects, tol=3.0) -> List[float]:
+    """从矩形列表提取垂直线 X 坐标（去重）。"""
+    xs: Set[float] = set()
+    for r in rects:
+        if abs(r.x0 - r.x1) < tol:       # 窄矩形 = 垂直线
+            xs.add(round(r.x0, 1))
+    return sorted(xs)
+
+
+def _cells_in_grid(text_boxes: List[LTTextBox],
+                   hYs: List[float], vXs: List[float]) -> List[List[str]]:
+    """
+    将 text_boxes 分配到 (rows x cols) 网格单元格。
+    返回二维列表 raw_cells。
+    """
+    if not hYs or not vXs:
+        return []
+
+    n_rows = len(hYs) - 1
+    n_cols = len(vXs) - 1
+    if n_rows <= 0 or n_cols <= 0:
+        return []
+
+    # 初始化空网格
+    grid: List[List[Optional[str]]] = [
+        [None] * n_cols for _ in range(n_rows)
+    ]
+
+    for tb in text_boxes:
+        cx = (tb.x0 + tb.x1) / 2.0
+        cy = (tb.y0 + tb.y1) / 2.0
+        for ri, y_bot in enumerate(hYs[:-1]):
+            if cy <= y_bot:
+                continue
+            for ci, x_left in enumerate(vXs[:-1]):
+                if cx >= x_left:
+                    continue
+                # 找到所在单元格
+                if grid[ri][ci] is None:
+                    grid[ri][ci] = tb.get_text().strip()
+                else:
+                    grid[ri][ci] += " " + tb.get_text().strip()
+                break
+            break
+
+    # None 替换为空字符串
+    return [[cell if cell else "" for cell in row] for row in grid]
+
+
+def _recognize_table(page_elements, base_size: float) -> Tuple[Optional[Block], List[LTTextBox]]:
+    """
+    扫描页面中的 LTRect/LTLine，尝试识别表格区域。
+    返回 (Block 或 None, 已归入表格的 TextBox 列表)。
+    """
+    rects = []
+    for el in page_elements:
+        if isinstance(el, LTRect):
+            rects.append(el)
+        elif isinstance(el, LTCurve) or isinstance(el, LTLine):
+            # 将曲线/线条视为同尺寸矩形
+            rects.append(el)
+
+    if len(rects) < 4:
+        return None, []
+
+    hYs = _h_lines(rects)
+    vXs = _v_lines(rects)
+
+    # 至少 2 行 2 列才视为表格
+    if len(hYs) < 3 or len(vXs) < 3:
+        return None, []
+
+    # 收集所有 TextBox，检查是否有多个落在网格内
+    text_boxes = [el for el in page_elements if isinstance(el, LTTextBox)]
+    if len(text_boxes) < 2:
+        return None, []
+
+    raw_cells = _cells_in_grid(text_boxes, hYs, vXs)
+    rows_with_content = [row for row in raw_cells if any(cell for cell in row)]
+
+    # 至少 2 行有内容才视为表格
+    if len(rows_with_content) < 2:
+        return None, []
+
+    # 过滤掉已被归入表格的 TextBox
+    used_boxes = []
+    for tb in text_boxes:
+        cx = (tb.x0 + tb.x1) / 2.0
+        cy = (tb.y0 + tb.y1) / 2.0
+        for ri in range(len(hYs) - 1):
+            for ci in range(len(vXs) - 1):
+                if (hYs[ri] >= cy > hYs[ri + 1] and
+                        vXs[ci] <= cx < vXs[ci + 1]):
+                    used_boxes.append(tb)
+
+    block = Block(type="table", content="", level=1,
+                  raw_cells=raw_cells)
+    return block, used_boxes
+
+
+# ─── 矢量图提取（通过 pdftoppm / ghostscript）───────────────
+
+def _render_vector_figure(pdf_path: str, page_idx: int,
+                          figure, image_output_dir: str,
+                          image_counter: list) -> Optional[Block]:
+    """
+    将 LTFigure 区域渲染为 PNG。
+    使用 bbox 裁剪页面，只保留该 figure 区域。
+    """
+    bbox = _bbox(figure)
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    filename = f"image_{image_counter[0]:03d}.png"
+    image_counter[0] += 1
+    out_path = os.path.join(image_output_dir, filename)
+
+    # 尝试 pdftoppm（poppler）
+    try:
+        cmd = [
+            "pdftoppm",
+            "-f", str(page_idx + 1),
+            "-l", str(page_idx + 1),
+            "-r", "150",
+            "-cropbox",
+            "-x", str(int(x0)),
+            "-y", str(int(y0)),
+            "-W", str(int(x1 - x0)),
+            "-H", str(int(y1 - y0)),
+            pdf_path,
+            out_path,
+        ]
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(out_path + "-1.png"):
+            # pdftoppm 输出为 image-1.png / image-2.png ...
+            generated = out_path + "-1.png"
+            if os.path.exists(generated):
+                os.rename(generated, out_path)
+            return Block(type="image", content="", image_path=filename)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log_warn(f"pdftoppm 失败: {e}")
+
+    # 回退：ghostscript
+    try:
+        # ghostscript 渲染整个页面再裁剪较复杂，用 pdftocairo 更方便
+        cmd = [
+            "pdftocairo",
+            "-f", str(page_idx + 1),
+            "-l", str(page_idx + 1),
+            "-r", "150",
+            "-cropbox",
+            "-x", str(int(x0)),
+            "-y", str(int(y0)),
+            "-W", str(int(x1 - x0)),
+            "-H", str(int(y1 - y0)),
+            "-png",
+            pdf_path,
+            out_path,
+        ]
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(out_path + "-1.png"):
+            generated = out_path + "-1.png"
+            if os.path.exists(generated):
+                os.rename(generated, out_path)
+            return Block(type="image", content="", image_path=filename)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log_warn(f"pdftocairo 失败: {e}")
+
+    return None
+
+
+# ─── 页面处理 ────────────────────────────────────────────────
+
+def _process_page(page_layout, page_idx: int, base_size: float,
+                  pdf_path: str, image_output_dir: str,
+                  image_counter: list) -> List[Block]:
     blocks = []
-    for element in page_layout:
+    page_elements = list(page_layout)
+
+    # ── 表格识别（优先，消耗 LTRect）─────────────────────────
+    table_block, used_text_boxes = _recognize_table(page_elements, base_size)
+    if table_block is not None:
+        blocks.append(table_block)
+
+    # ── 文本块（排除已归入表格的）─────────────────────────
+    used_ids = {id(tb) for tb in used_text_boxes}
+    for element in page_elements:
         if isinstance(element, LTTextBox):
+            if id(element) in used_ids:
+                continue
             text = element.get_text().strip()
             if not text:
                 continue
             avg_size, is_bold, is_italic = _get_char_info(element)
             block = _classify_block(text, avg_size, is_bold, is_italic, base_size)
             blocks.append(block)
+
+        # ── 嵌入位图（LTImage）─────────────────────────────
         elif isinstance(element, LTFigure):
-            blocks.extend(_extract_images(element, image_output_dir, image_counter))
-        elif isinstance(element, LTRect):
-            pass  # 表格识别复杂度高，本版本跳过
+            img_blocks = _extract_images(element, image_output_dir, image_counter)
+            if img_blocks:
+                blocks.extend(img_blocks)
+            else:
+                # 没有位图 → 可能是矢量图（流程图/线条图）
+                # 检查是否含 LTCurve / LTLine
+                has_vector = any(
+                    isinstance(c, (LTCurve, LTLine, LTRect))
+                    for c in element
+                )
+                if has_vector:
+                    vb = _render_vector_figure(
+                        pdf_path, page_idx, element,
+                        image_output_dir, image_counter
+                    )
+                    if vb is not None:
+                        blocks.append(vb)
+
     return blocks
 
+
+# ─── 主入口 ────────────────────────────────────────────────
 
 def parse_pdf(pdf_path: str, image_output_dir: str) -> List[Block]:
     if not os.path.exists(pdf_path):
@@ -135,7 +377,7 @@ def parse_pdf(pdf_path: str, image_output_dir: str) -> List[Block]:
     image_counter = [0]
 
     try:
-        # 第一遍：收集所有字体大小，计算正文基准字体大小
+        # 第一遍：收集字体大小基准
         font_sizes = []
         for page_layout in extract_pages(pdf_path):
             for element in page_layout:
@@ -146,12 +388,15 @@ def parse_pdf(pdf_path: str, image_output_dir: str) -> List[Block]:
                                 if isinstance(char, LTChar) and char.size > 0:
                                     font_sizes.append(round(char.size, 1))
 
-        # 取众数作为正文基准字体大小
         base_size = _get_mode(font_sizes) if font_sizes else 12.0
 
-        # 第二遍：提取内容
-        for page_layout in extract_pages(pdf_path):
-            page_blocks = _process_page(page_layout, base_size, image_output_dir, image_counter)
+        # 第二遍：提取内容（同时获取页码）
+        pages = list(extract_pages(pdf_path))
+        for page_idx, page_layout in enumerate(pages):
+            page_blocks = _process_page(
+                page_layout, page_idx, base_size,
+                pdf_path, image_output_dir, image_counter
+            )
             blocks.extend(page_blocks)
 
     except FileNotFoundError:
