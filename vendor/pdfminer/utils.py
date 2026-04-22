@@ -28,7 +28,6 @@ from typing import (
 if TYPE_CHECKING:
     from .layout import LTComponent
 
-import charset_normalizer  # For str encoding detection
 
 # from sys import maxint as INF doesn't work anymore under Python3, but PDF
 # still uses 32 bits ints
@@ -75,11 +74,12 @@ def make_compat_bytes(in_str: str) -> bytes:
 def make_compat_str(o: object) -> str:
     """Converts everything to string, if bytes guessing the encoding."""
     if isinstance(o, bytes):
-        enc = charset_normalizer.detect(o)
-        try:
-            return o.decode(enc["encoding"])
-        except UnicodeDecodeError:
-            return str(o)
+        for enc in ("utf-8", "latin-1"):
+            try:
+                return o.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return str(o)
     else:
         return str(o)
 
