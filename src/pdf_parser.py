@@ -9,6 +9,22 @@ from typing import List, Optional, Tuple, Set
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vendor'))
 
+
+def _get_tools_dir() -> str:
+    """返回 tools 目录的绝对路径。"""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools')
+
+
+def _find_binary(name: str) -> Optional[str]:
+    """在 tools/usr/bin/ 中查找可执行文件，找不到则回退到 PATH 中的同名工具。"""
+    tools_bin = os.path.join(_get_tools_dir(), 'usr', 'bin')
+    bundled = os.path.join(tools_bin, name)
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled
+    # 回退：找系统 PATH 中的同名工具
+    import shutil
+    return shutil.which(name)
+
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
     LTPage, LTTextBox, LTTextLine, LTChar, LTFigure, LTImage,
@@ -109,7 +125,9 @@ def _extract_images(figure, image_output_dir: str,
                 elif data[:4] == b'\x89PNG':
                     ext = "png"
                 else:
-                    ext = "bin"
+                    # 无法识别的位图数据，跳过（避免生成无意义的 .bin 文件）
+                    log_warn(f"跳过无法识别的嵌入图片数据（格式未知）")
+                    continue
                 filename = f"image_{image_counter[0]:03d}.{ext}"
                 image_counter[0] += 1
                 out_path = os.path.join(image_output_dir, filename)
@@ -257,8 +275,9 @@ def _render_vector_figure(pdf_path: str, page_idx: int,
 
     # 尝试 pdftoppm（poppler）
     try:
+        pdftoppm = _find_binary("pdftoppm")
         cmd = [
-            "pdftoppm",
+            pdftoppm,
             "-f", str(page_idx + 1),
             "-l", str(page_idx + 1),
             "-r", "150",
@@ -284,11 +303,11 @@ def _render_vector_figure(pdf_path: str, page_idx: int,
     except Exception as e:
         log_warn(f"pdftoppm 失败: {e}")
 
-    # 回退：ghostscript
+    # 回退：pdftocairo
     try:
-        # ghostscript 渲染整个页面再裁剪较复杂，用 pdftocairo 更方便
+        pdftocairo = _find_binary("pdftocairo")
         cmd = [
-            "pdftocairo",
+            pdftocairo,
             "-f", str(page_idx + 1),
             "-l", str(page_idx + 1),
             "-r", "150",

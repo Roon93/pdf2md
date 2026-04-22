@@ -18,7 +18,7 @@ _SYSTEM_PROMPT = (
 DEFAULT_MAX_RETRIES = 5       # 最多重试 5 次（429 时）
 DEFAULT_BASE_DELAY = 1.0     # 首次重试延迟 1 秒
 DEFAULT_MAX_DELAY = 120.0    # 最长延迟 120 秒
-DEFAULT_RPM = 60             # 默认 RPM 限流值（可配置）
+DEFAULT_RPM = 20             # 默认 RPM 限流值（可配置）
 
 
 class RateLimiter:

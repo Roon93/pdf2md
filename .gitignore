@@ -1,3 +1,10 @@
 /tmp/
 *.pyc
 __pycache__/
+
+# tools/ — use tools/fetch_tools.sh to download binaries+libs from RPM
+tools/usr/
+tools/lib/
+tools/lib64/
+tools/share/
+tools/bin/
